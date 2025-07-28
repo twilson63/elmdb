@@ -94,7 +94,11 @@
          txn_cursor_get/2,
          txn_cursor_get/3,
          txn_cursor_put/3,
-         txn_cursor_put/4
+         txn_cursor_put/4,
+         
+         env_copy_compact/2,
+         env_copy_compact/3,
+         reader_check/1
         ]).
 
 
@@ -516,6 +520,39 @@ txn_cursor_put(Cur, Key, Val, Timeout) ->
     end.
 
 nif_txn_cursor_put(_Ref, _Cur, _Key, _Val) ->
+    ?NOT_LOADED.
+
+%%--------------------------------------------------------------------
+%% @doc Perform compaction copy of environment to a new path.
+%% This creates a compact copy of the environment, removing free pages
+%% and sequentially renumbering all pages. The resulting database will
+%% be smaller if there was fragmentation in the original.
+%% @end
+%%--------------------------------------------------------------------
+-spec env_copy_compact(env(), string() | binary()) -> ok | elmdb_error().
+env_copy_compact(Env, Path) ->
+    env_copy_compact(Env, Path, ?TIMEOUT).
+
+-spec env_copy_compact(env(), string() | binary(), non_neg_integer()) -> ok | elmdb_error().
+env_copy_compact(Env, Path, Timeout) ->
+    Ref = make_ref(),
+    case nif_env_copy_compact(Ref, Env, Path) of
+        ok    -> recv_async(Ref, Timeout);
+        Error -> Error
+    end.
+
+nif_env_copy_compact(_Ref, _Env, _Path) ->
+    ?NOT_LOADED.
+
+%%--------------------------------------------------------------------
+%% @doc Check for stale reader slots in the lock table.
+%% Returns the number of stale slots that were cleared.
+%% Stale readers can occur when processes crash without properly 
+%% cleaning up their transactions.
+%% @end
+%%--------------------------------------------------------------------
+-spec reader_check(env()) -> {ok, non_neg_integer()} | elmdb_error().
+reader_check(_Env) ->
     ?NOT_LOADED.
 
 %%====================================================================

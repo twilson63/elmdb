@@ -33,6 +33,7 @@
 #include <errno.h>
 #include <sys/param.h>
 #include <unistd.h>
+#include <alloca.h>
 #include <erl_nif.h>
 #include <erl_driver.h>
 
@@ -703,8 +704,12 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsiz
     else if(enif_get_tuple(env, head, &tup_arity, &tup_array) != 0) {
       if(tup_arity == 2) {
 
-        if(enif_is_identical(tup_array[0], ATOM_MAPSIZE) != 0 &&
-           enif_get_uint64(env, tup_array[1], &_mapsize) == 0)
+        if(enif_is_identical(tup_array[0], ATOM_MAPSIZE) != 0) {
+           unsigned long temp_mapsize;
+           if(enif_get_ulong(env, tup_array[1], &temp_mapsize) == 0)
+             return 0;
+           _mapsize = temp_mapsize;
+        } else
           return 0;
 
         if(enif_is_identical(tup_array[0], ATOM_MAXDBS) != 0 &&
@@ -2576,6 +2581,124 @@ static void elmdb_unload(ErlNifEnv* env, void* priv_data)
   return;
 }
 
+/**
+ * Compact copy environment - args structure
+ */
+typedef struct {
+  ElmdbEnv *elmdb_env;
+  char path[MAXPATHLEN];
+} copy_args;
+
+/**
+ * Handler for async env_copy_compact operation
+ */
+static MDB_txn* elmdb_env_copy_compact_handler(MDB_txn *txn, OpEntry *op) {
+  copy_args *args = (copy_args*)op->args;
+  int ret;
+  
+  /* Perform compaction copy */
+  ret = mdb_env_copy2(args->elmdb_env->env, args->path, MDB_CP_COMPACT);
+  
+  if(ret != MDB_SUCCESS) {
+    SEND_ERRNO(op, ret);
+  } else {
+    SEND(op, ATOM_OK);
+  }
+  
+  enif_release_resource(args->elmdb_env);
+  return NULL;
+}
+
+/**
+ * Perform compaction copy of environment
+ * 
+ * argv[0]    reference to async operation
+ * argv[1]    reference to the MDB environment resource
+ * argv[2]    target path as binary or string
+ */
+static ERL_NIF_TERM elmdb_env_copy_compact(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  ElmdbEnv *elmdb_env;
+  ErlNifBinary bin_path;
+  char *path;
+
+  if(argc != 3 ||
+     !enif_get_resource(env, argv[1], elmdb_env_res, (void**)&elmdb_env)) {
+    return BADARG;
+  }
+
+  /* Check if environment is valid */
+  LOCKED_CHECK_ENV(elmdb_env);
+
+  /* Get path parameter */
+  char path_buf[MAXPATHLEN];
+  if(enif_inspect_binary(env, argv[2], &bin_path)) {
+    if(bin_path.size >= MAXPATHLEN) {
+      return BADARG;
+    }
+    memcpy(path_buf, bin_path.data, bin_path.size);
+    path_buf[bin_path.size] = '\0';
+    path = path_buf;
+  } else {
+    int len = enif_get_string(env, argv[2], path_buf, MAXPATHLEN, ERL_NIF_LATIN1);
+    if(len <= 0) {
+      return BADARG;
+    }
+    path = path_buf;
+  }
+
+  /* Create operation entry */
+  copy_args *args = enif_alloc(sizeof(copy_args));
+  NEW_OP(op_entry, args, elmdb_env_copy_compact_handler);
+  op_entry->txn_ref = 0;
+  args->elmdb_env = elmdb_env;
+  strncpy(args->path, path, MAXPATHLEN - 1);
+  args->path[MAXPATHLEN - 1] = '\0';
+  
+  enif_keep_resource(elmdb_env);
+  
+  /* Queue the operation */
+  enif_mutex_lock(elmdb_env->txn_lock);
+  PUSH(elmdb_env->txn_queue, op_entry);
+  enif_cond_signal(elmdb_env->txn_cond);
+  enif_mutex_unlock(elmdb_env->txn_lock);
+  
+  return ATOM_OK;
+}
+
+/**
+ * Check for stale reader slots
+ * 
+ * argv[0]    reference to the MDB environment resource
+ */
+static ERL_NIF_TERM elmdb_reader_check(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  ElmdbEnv *elmdb_env;
+  int dead = 0;
+  int ret;
+
+  if(argc != 1 ||
+     !enif_get_resource(env, argv[0], elmdb_env_res, (void**)&elmdb_env)) {
+    return BADARG;
+  }
+
+  /* Check if environment is valid */
+  enif_mutex_lock(elmdb_env->txn_lock);
+  if(elmdb_env->shutdown > 0) {
+    enif_mutex_unlock(elmdb_env->txn_lock);
+    return ERRNO(ATOM_ENV_CLOSED);
+  }
+  enif_mutex_unlock(elmdb_env->txn_lock);
+
+  /* Call mdb_reader_check */
+  ret = mdb_reader_check(elmdb_env->env, &dead);
+  
+  if(ret != MDB_SUCCESS) {
+    return ERRNO(ret);
+  }
+  
+  /* Return tuple {ok, DeadCount} */
+  return enif_make_tuple2(env, ATOM_OK, enif_make_int(env, dead));
+}
+
 static ErlNifFunc nif_funcs [] = {
   {"nif_env_open",          3, elmdb_env_open, 0},
   {"env_close",             1, elmdb_env_close, 0},
@@ -2617,7 +2740,10 @@ static ErlNifFunc nif_funcs [] = {
 
   {"nif_txn_cursor_open", 3, elmdb_txn_cursor_open, 0},
   {"nif_txn_cursor_get",  3, elmdb_txn_cursor_get, 0},
-  {"nif_txn_cursor_put",  4, elmdb_txn_cursor_put, 0}
+  {"nif_txn_cursor_put",  4, elmdb_txn_cursor_put, 0},
+  
+  {"nif_env_copy_compact", 3, elmdb_env_copy_compact, 0},
+  {"reader_check", 1, elmdb_reader_check, 0}
 };
 
 /* driver entry point */
