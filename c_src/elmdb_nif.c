@@ -32,6 +32,7 @@
 #include <inttypes.h>
 #include <errno.h>
 #include <sys/param.h>
+#include <unistd.h>
 #include <erl_nif.h>
 #include <erl_driver.h>
 
@@ -1476,10 +1477,31 @@ static ERL_NIF_TERM elmdb_txn_cursor_put(ErlNifEnv* env, int argc, const ERL_NIF
   return ATOM_OK;
 }
 
+#define MAX_CONCURRENT_WRITES 50  /* Limit concurrent write transactions */
+
 static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
+  ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
- if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
+  static ErlNifMutex *write_limit_lock = NULL;
+  static int active_writes = 0;
+  
+  /* Initialize the write limit lock once */
+  if(!write_limit_lock) {
+    write_limit_lock = enif_mutex_create("write_limit");
+  }
+  
+  /* Wait if too many concurrent writes */
+  enif_mutex_lock(write_limit_lock);
+  while(active_writes >= MAX_CONCURRENT_WRITES) {
+    enif_mutex_unlock(write_limit_lock);
+    usleep(100); /* 0.1ms wait */
+    enif_mutex_lock(write_limit_lock);
+  }
+  active_writes++;
+  enif_mutex_unlock(write_limit_lock);
+  
+  if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
   }
@@ -1495,6 +1517,11 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   SEND(op, ATOM_OK);
 
  done:
+  /* Release write slot */
+  enif_mutex_lock(write_limit_lock);
+  active_writes--;
+  enif_mutex_unlock(write_limit_lock);
+  
   enif_release_resource(args->elmdb_dbi);
   return NULL;
 }
@@ -1545,8 +1572,27 @@ static ERL_NIF_TERM elmdb_async_put(ErlNifEnv* env, int argc, const ERL_NIF_TERM
 
 static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
+  ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
- if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
+  static ErlNifMutex *write_limit_lock = NULL;
+  static int active_writes = 0;
+  
+  /* Initialize the write limit lock once */
+  if(!write_limit_lock) {
+    write_limit_lock = enif_mutex_create("write_limit");
+  }
+  
+  /* Wait if too many concurrent writes */
+  enif_mutex_lock(write_limit_lock);
+  while(active_writes >= MAX_CONCURRENT_WRITES) {
+    enif_mutex_unlock(write_limit_lock);
+    usleep(100); /* 0.1ms wait */
+    enif_mutex_lock(write_limit_lock);
+  }
+  active_writes++;
+  enif_mutex_unlock(write_limit_lock);
+  
+  if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
   }
@@ -1566,6 +1612,11 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   SEND(op, ATOM_OK);
 
  done:
+  /* Release write slot */
+  enif_mutex_lock(write_limit_lock);
+  active_writes--;
+  enif_mutex_unlock(write_limit_lock);
+  
   enif_release_resource(args->elmdb_dbi);
   return NULL;
 }
