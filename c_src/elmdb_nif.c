@@ -1504,6 +1504,11 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
   
+  /* CRITICAL: Async operations must NEVER reuse transactions
+   * Each async operation needs its own isolated transaction
+   * to prevent mdb_page_dirty assertion failures */
+  txn = NULL;
+  
   /* Check for shutdown before proceeding */
   enif_mutex_lock(env->txn_lock);
   if(env->shutdown > 0) {
@@ -1596,6 +1601,9 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
   ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
+  
+  /* CRITICAL: Async operations must NEVER reuse transactions */
+  txn = NULL;
   
   /* Check for shutdown before proceeding */
   enif_mutex_lock(env->txn_lock);
@@ -1719,6 +1727,10 @@ static ERL_NIF_TERM elmdb_async_get(ErlNifEnv* env, int argc, const ERL_NIF_TERM
 static MDB_txn* elmdb_async_delete_handler(MDB_txn *txn, OpEntry *op) {
   k_args *args = (k_args*)op->args;
   int ret;
+  
+  /* CRITICAL: Async operations must NEVER reuse transactions */
+  txn = NULL;
+  
   if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
@@ -1776,6 +1788,10 @@ static ERL_NIF_TERM elmdb_async_delete(ErlNifEnv* env, int argc, const ERL_NIF_T
 static MDB_txn* elmdb_async_drop_handler(MDB_txn *txn, OpEntry *op) {
   dbi_args *args = (dbi_args*)op->args;
   int ret;
+  
+  /* CRITICAL: Async operations must NEVER reuse transactions */
+  txn = NULL;
+  
   if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
