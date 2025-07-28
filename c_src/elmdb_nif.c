@@ -231,6 +231,15 @@ static ERL_NIF_TERM ATOM_PREV_NODUP;
 static ERL_NIF_TERM ATOM_SET;
 static ERL_NIF_TERM ATOM_SET_RANGE;
 
+/* Global write throttling variables */
+static ErlNifMutex *g_write_limit_lock = NULL;
+static ErlNifCond *g_write_limit_cond = NULL;
+static int g_active_writes = 0;
+
+/* Global initialization synchronization */
+static ErlNifMutex *g_init_lock = NULL;
+static int g_initialized = 0;
+
 #define OP_HANDLER(handler) (MDB_txn* (*)(MDB_txn *, OpEntry*))handler
 
 #define NEW_OP_(op_var, op_args, op_handler)                   \
@@ -472,7 +481,9 @@ static ElmdbEnv* open_env(const char *path, uint64_t mapsize, int maxdbs, int en
   elmdb_env->active_txn_ref = 0;
   elmdb_env->txn_ref_cnt    = 0;
   elmdb_env->shutdown       = 0;
-  strncpy(elmdb_env->path, path, MAXPATHLEN);
+  /* Ensure null-termination of path */
+  strncpy(elmdb_env->path, path, MAXPATHLEN - 1);
+  elmdb_env->path[MAXPATHLEN - 1] = '\0';
   STAILQ_INIT(&elmdb_env->op_queue);
   STAILQ_INIT(&elmdb_env->txn_queue);
 
@@ -846,7 +857,8 @@ static MDB_txn* elmdb_db_open_handler(MDB_txn *txn, OpEntry *op) {
       SEND_ERRNO(op, ENOMEM);
       goto err;
     }
-    strncpy(name, args->name, MAXPATHLEN);
+    strncpy(name, args->name, len);
+    name[len] = '\0';
   }
 
   if((ret = mdb_txn_begin(args->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
@@ -901,7 +913,10 @@ static ERL_NIF_TERM elmdb_db_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM a
   db_open_args *args = enif_alloc(sizeof(db_open_args));
   NEW_OP(op, args, elmdb_db_open_handler);
   memset(args->name, 0, MAXPATHLEN);
-  strncpy(args->name, (char*)db_name.data, db_name.size);
+  /* Ensure we don't overflow and null-terminate */
+  size_t copy_len = db_name.size < MAXPATHLEN - 1 ? db_name.size : MAXPATHLEN - 1;
+  strncpy(args->name, (char*)db_name.data, copy_len);
+  args->name[copy_len] = '\0';
   args->elmdb_env = elmdb_env;
   args->flags = flags;
   enif_keep_resource(elmdb_env);
@@ -1483,23 +1498,24 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
   ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
-  static ErlNifMutex *write_limit_lock = NULL;
-  static int active_writes = 0;
   
-  /* Initialize the write limit lock once */
-  if(!write_limit_lock) {
-    write_limit_lock = enif_mutex_create("write_limit");
+  /* Check for shutdown before proceeding */
+  enif_mutex_lock(env->txn_lock);
+  if(env->shutdown > 0) {
+    enif_mutex_unlock(env->txn_lock);
+    SEND_ERR(op, ATOM_ENV_CLOSED);
+    enif_release_resource(args->elmdb_dbi);
+    return NULL;
   }
+  enif_mutex_unlock(env->txn_lock);
   
-  /* Wait if too many concurrent writes */
-  enif_mutex_lock(write_limit_lock);
-  while(active_writes >= MAX_CONCURRENT_WRITES) {
-    enif_mutex_unlock(write_limit_lock);
-    usleep(100); /* 0.1ms wait */
-    enif_mutex_lock(write_limit_lock);
+  /* Wait if too many concurrent writes using global condition variable */
+  enif_mutex_lock(g_write_limit_lock);
+  while(g_active_writes >= MAX_CONCURRENT_WRITES) {
+    enif_cond_wait(g_write_limit_cond, g_write_limit_lock);
   }
-  active_writes++;
-  enif_mutex_unlock(write_limit_lock);
+  g_active_writes++;
+  enif_mutex_unlock(g_write_limit_lock);
   
   if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
@@ -1517,10 +1533,11 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   SEND(op, ATOM_OK);
 
  done:
-  /* Release write slot */
-  enif_mutex_lock(write_limit_lock);
-  active_writes--;
-  enif_mutex_unlock(write_limit_lock);
+  /* Release write slot and signal waiting threads */
+  enif_mutex_lock(g_write_limit_lock);
+  g_active_writes--;
+  enif_cond_signal(g_write_limit_cond);
+  enif_mutex_unlock(g_write_limit_lock);
   
   enif_release_resource(args->elmdb_dbi);
   return NULL;
@@ -1574,23 +1591,24 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
   ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
-  static ErlNifMutex *write_limit_lock = NULL;
-  static int active_writes = 0;
   
-  /* Initialize the write limit lock once */
-  if(!write_limit_lock) {
-    write_limit_lock = enif_mutex_create("write_limit");
+  /* Check for shutdown before proceeding */
+  enif_mutex_lock(env->txn_lock);
+  if(env->shutdown > 0) {
+    enif_mutex_unlock(env->txn_lock);
+    SEND_ERR(op, ATOM_ENV_CLOSED);
+    enif_release_resource(args->elmdb_dbi);
+    return NULL;
   }
+  enif_mutex_unlock(env->txn_lock);
   
-  /* Wait if too many concurrent writes */
-  enif_mutex_lock(write_limit_lock);
-  while(active_writes >= MAX_CONCURRENT_WRITES) {
-    enif_mutex_unlock(write_limit_lock);
-    usleep(100); /* 0.1ms wait */
-    enif_mutex_lock(write_limit_lock);
+  /* Wait if too many concurrent writes using global condition variable */
+  enif_mutex_lock(g_write_limit_lock);
+  while(g_active_writes >= MAX_CONCURRENT_WRITES) {
+    enif_cond_wait(g_write_limit_cond, g_write_limit_lock);
   }
-  active_writes++;
-  enif_mutex_unlock(write_limit_lock);
+  g_active_writes++;
+  enif_mutex_unlock(g_write_limit_lock);
   
   if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
@@ -1612,10 +1630,11 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   SEND(op, ATOM_OK);
 
  done:
-  /* Release write slot */
-  enif_mutex_lock(write_limit_lock);
-  active_writes--;
-  enif_mutex_unlock(write_limit_lock);
+  /* Release write slot and signal waiting threads */
+  enif_mutex_lock(g_write_limit_lock);
+  g_active_writes--;
+  enif_cond_signal(g_write_limit_cond);
+  enif_mutex_unlock(g_write_limit_lock);
   
   enif_release_resource(args->elmdb_dbi);
   return NULL;
@@ -2345,6 +2364,69 @@ static void elmdb_ro_cur_dtor(ErlNifEnv *env, void *resource) {
   enif_release_resource(elmdb_ro_cur->elmdb_ro_txn);
 }
 
+/* Thread-safe global initialization helper */
+static int elmdb_init_globals(void)
+{
+  int result = 0;
+  
+  /* First, ensure we have the initialization lock */
+  if(g_init_lock == NULL) {
+    /* This is the bootstrap case - we need to create the init lock itself.
+     * There's a small race here, but it's handled by the fact that
+     * enif_mutex_create is idempotent and we check again after acquiring. */
+    ErlNifMutex *temp_lock = enif_mutex_create("g_init_lock");
+    if(temp_lock == NULL) {
+      return ENOMEM;
+    }
+    
+    /* Use atomic compare-and-swap if available, otherwise accept the race
+     * on the init lock creation itself (happens only once at startup) */
+    if(__sync_bool_compare_and_swap(&g_init_lock, NULL, temp_lock)) {
+      /* We successfully installed our lock */
+    } else {
+      /* Another thread beat us, destroy our lock and use theirs */
+      enif_mutex_destroy(temp_lock);
+    }
+  }
+  
+  /* Now we can safely lock and initialize everything else */
+  enif_mutex_lock(g_init_lock);
+  
+  /* Double-check pattern - check if already initialized while holding the lock */
+  if(g_initialized) {
+    enif_mutex_unlock(g_init_lock);
+    return 0;
+  }
+  
+  /* Initialize write throttling resources */
+  if(g_write_limit_lock == NULL) {
+    g_write_limit_lock = enif_mutex_create("g_write_limit");
+    if(g_write_limit_lock == NULL) {
+      result = ENOMEM;
+      goto cleanup;
+    }
+  }
+  
+  if(g_write_limit_cond == NULL) {
+    g_write_limit_cond = enif_cond_create("g_write_limit");
+    if(g_write_limit_cond == NULL) {
+      enif_mutex_destroy(g_write_limit_lock);
+      g_write_limit_lock = NULL;
+      result = ENOMEM;
+      goto cleanup;
+    }
+  }
+  
+  g_active_writes = 0;
+  
+  /* Mark as initialized only if everything succeeded */
+  g_initialized = 1;
+  
+cleanup:
+  enif_mutex_unlock(g_init_lock);
+  return result;
+}
+
 static int elmdb_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
 {
   __UNUSED(load_info);
@@ -2354,9 +2436,19 @@ static int elmdb_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
   ElmdbPriv *priv = enif_alloc(sizeof(ElmdbPriv));
   if(priv == NULL)
     return ENOMEM;
+    
+  /* Initialize global resources in a thread-safe manner */
+  int init_result = elmdb_init_globals();
+  if(init_result != 0) {
+    enif_free(priv);
+    return init_result;
+  }
+  
   SLIST_INIT(&priv->env_list);
-  if((priv->env_lock = enif_mutex_create("env_lock")) == NULL)
+  if((priv->env_lock = enif_mutex_create("env_lock")) == NULL) {
+    enif_free(priv);
     return ENOMEM;
+  }
   priv->env_ref = 0;
   *priv_data = priv;
 
@@ -2453,6 +2545,33 @@ static void elmdb_unload(ErlNifEnv* env, void* priv_data)
   __UNUSED(env);
   ElmdbPriv *priv = (ElmdbPriv*)priv_data;
   close_all(priv);
+  
+  /* Clean up global resources - but only if we have the init lock
+   * This prevents race conditions during shutdown */
+  if(g_init_lock != NULL) {
+    enif_mutex_lock(g_init_lock);
+    
+    if(g_initialized) {
+      /* Clean up write throttling resources */
+      if(g_write_limit_cond != NULL) {
+        enif_cond_destroy(g_write_limit_cond);
+        g_write_limit_cond = NULL;
+      }
+      if(g_write_limit_lock != NULL) {
+        enif_mutex_destroy(g_write_limit_lock);
+        g_write_limit_lock = NULL;
+      }
+      g_active_writes = 0;
+      g_initialized = 0;
+    }
+    
+    enif_mutex_unlock(g_init_lock);
+    
+    /* Note: We don't destroy g_init_lock itself as other threads
+     * might still be in elmdb_load. The lock will be cleaned up
+     * when the NIF is completely unloaded from memory. */
+  }
+  
   enif_free(priv);
   return;
 }
