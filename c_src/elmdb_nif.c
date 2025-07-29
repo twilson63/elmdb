@@ -65,6 +65,8 @@ typedef struct {
 
   STAILQ_HEAD(op_queue, _OpEntry) op_queue;
   STAILQ_HEAD(txn_queue, _OpEntry) txn_queue;
+  int txn_queue_size;  /* Track queue size to prevent unbounded growth */
+  int max_queue_size;  /* Configurable maximum queue size */
 } ElmdbEnv;
 
 static ErlNifResourceType *elmdb_dbi_res;
@@ -118,6 +120,7 @@ typedef struct {
   uint64_t mapsize;
   unsigned int maxdbs;
   unsigned int envflags;
+  unsigned int queue_size;
   ErlNifPid caller;
   ERL_NIF_TERM ref;
   ErlNifEnv *msg_env;
@@ -182,6 +185,7 @@ static ERL_NIF_TERM ATOM_NORDAHEAD;
 static ERL_NIF_TERM ATOM_NOMEMINIT;
 static ERL_NIF_TERM ATOM_MAPSIZE;
 static ERL_NIF_TERM ATOM_MAXDBS;
+static ERL_NIF_TERM ATOM_QUEUE_SIZE;
 
 static ERL_NIF_TERM ATOM_REVERSEKEY;
 static ERL_NIF_TERM ATOM_DUPSORT;
@@ -468,7 +472,7 @@ static int to_mdb_cursor_op(ErlNifEnv *env, ERL_NIF_TERM op, MDB_val *key) {
   return 0;
 }
 
-static ElmdbEnv* open_env(const char *path, uint64_t mapsize, int maxdbs, int envflags, int *ret) {
+static ElmdbEnv* open_env(const char *path, uint64_t mapsize, int maxdbs, int envflags, unsigned int queue_size, int *ret) {
   ElmdbEnv *elmdb_env;
 
   if((elmdb_env = enif_alloc_resource(elmdb_env_res, sizeof(ElmdbEnv))) == NULL)
@@ -487,6 +491,8 @@ static ElmdbEnv* open_env(const char *path, uint64_t mapsize, int maxdbs, int en
   elmdb_env->path[MAXPATHLEN - 1] = '\0';
   STAILQ_INIT(&elmdb_env->op_queue);
   STAILQ_INIT(&elmdb_env->txn_queue);
+  elmdb_env->txn_queue_size = 0;  /* Initialize queue size counter */
+  elmdb_env->max_queue_size = queue_size;  /* Set configurable max queue size */
 
   if((*ret = mdb_env_create(&(elmdb_env->env))) != MDB_SUCCESS)
     goto err1;
@@ -578,7 +584,7 @@ static void* elmdb_env_thread(void *p) {
   OpEntry *q_txn = NULL;
   OpEntry *q_op = NULL;
 
-  if((elmdb_env = open_env(args->path, args->mapsize, args->maxdbs, args->envflags, &ret)) == NULL) {
+  if((elmdb_env = open_env(args->path, args->mapsize, args->maxdbs, args->envflags, args->queue_size, &ret)) == NULL) {
     SEND_ERRNO(args, ret);
     enif_free_env(args->msg_env);
     return NULL;
@@ -599,6 +605,7 @@ static void* elmdb_env_thread(void *p) {
     enif_cond_wait(elmdb_env->txn_cond, elmdb_env->txn_lock);
     while(!STAILQ_EMPTY(&elmdb_env->txn_queue)) {
       POP(elmdb_env->txn_queue, q_txn);
+      elmdb_env->txn_queue_size--;  /* Decrement queue size */
       enif_mutex_unlock(elmdb_env->txn_lock);
       txn = q_txn->handler(txn, q_txn);
       enif_mutex_lock(elmdb_env->txn_lock);
@@ -670,10 +677,11 @@ static ElmdbEnv* get_env(ElmdbPriv *priv, const char *path) {
   return NULL;
 }
 
-static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsize, unsigned int *maxdbs, unsigned int *flags) {
+static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsize, unsigned int *maxdbs, unsigned int *flags, unsigned int *queue_size) {
   uint64_t _mapsize = 1073741824;
   unsigned int _maxdbs = 0;
   unsigned int _flags = MDB_NOTLS;
+  unsigned int _queue_size = 10000;  /* Default queue size */
   ERL_NIF_TERM head, tail;
   const ERL_NIF_TERM *tup_array;
   int tup_arity = 0;
@@ -709,6 +717,11 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsiz
            if(enif_get_ulong(env, tup_array[1], &temp_mapsize) == 0)
              return 0;
            _mapsize = temp_mapsize;
+        } else if(enif_is_identical(tup_array[0], ATOM_QUEUE_SIZE) != 0) {
+           unsigned int temp_queue_size;
+           if(enif_get_uint(env, tup_array[1], &temp_queue_size) == 0)
+             return 0;
+           _queue_size = temp_queue_size;
         } else
           return 0;
 
@@ -722,6 +735,7 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsiz
   *mapsize = _mapsize;
   *maxdbs = _maxdbs;
   *flags = _flags;
+  *queue_size = _queue_size;
   return 1;
 }
 
@@ -776,7 +790,7 @@ static ERL_NIF_TERM elmdb_env_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
   if(enif_get_string(env, argv[1], args->path, MAXPATHLEN, ERL_NIF_LATIN1) == 0)
     return BADARG;
 
-  if(get_env_open_opts(env, argv[2], &args->mapsize, &args->maxdbs, &args->envflags) == 0)
+  if(get_env_open_opts(env, argv[2], &args->mapsize, &args->maxdbs, &args->envflags, &args->queue_size) == 0)
     return BADARG;
 
   args->priv = (ElmdbPriv*)enif_priv_data(env);
@@ -1497,7 +1511,9 @@ static ERL_NIF_TERM elmdb_txn_cursor_put(ErlNifEnv* env, int argc, const ERL_NIF
   return ATOM_OK;
 }
 
-#define MAX_CONCURRENT_WRITES 50  /* Limit concurrent write transactions */
+#define MAX_CONCURRENT_WRITES 200  /* Increased for better concurrency */
+#define MAX_QUEUE_SIZE 10000        /* Maximum pending operations */
+#define QUEUE_TIMEOUT_MS 10         /* Timeout for queue operations in ms */
 
 static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
@@ -1519,11 +1535,23 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   }
   enif_mutex_unlock(env->txn_lock);
   
-  /* Wait if too many concurrent writes using global condition variable */
+  /* Non-blocking write throttling with timeout */
   enif_mutex_lock(g_write_limit_lock);
-  while(g_active_writes >= MAX_CONCURRENT_WRITES) {
-    enif_cond_wait(g_write_limit_cond, g_write_limit_lock);
+  
+  if (g_active_writes >= MAX_CONCURRENT_WRITES) {
+    /* Try waiting with 10ms timeout instead of blocking forever */
+    enif_mutex_unlock(g_write_limit_lock);
+    usleep(1000); /* 1ms backoff */
+    enif_mutex_lock(g_write_limit_lock);
+    
+    /* Check again after backoff */
+    if (g_active_writes >= MAX_CONCURRENT_WRITES) {
+      enif_mutex_unlock(g_write_limit_lock);
+      SEND_ERR(op, enif_make_atom(op->msg_env, "write_throttle_timeout"));
+      goto done;
+    }
   }
+  
   g_active_writes++;
   enif_mutex_unlock(g_write_limit_lock);
   
@@ -1543,10 +1571,10 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   SEND(op, ATOM_OK);
 
  done:
-  /* Release write slot and signal waiting threads */
+  /* Release write slot and signal ALL waiting threads */
   enif_mutex_lock(g_write_limit_lock);
   g_active_writes--;
-  enif_cond_signal(g_write_limit_cond);
+  enif_cond_broadcast(g_write_limit_cond);  /* Wake all waiters to prevent deadlock */
   enif_mutex_unlock(g_write_limit_lock);
   
   enif_release_resource(args->elmdb_dbi);
@@ -1587,7 +1615,19 @@ static ERL_NIF_TERM do_async_put(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
   args->val.mv_data = bin_val.data;
   enif_keep_resource(elmdb_dbi);
   enif_mutex_lock(elmdb_dbi->elmdb_env->txn_lock);
+  
+  /* Check queue size to prevent unbounded growth */
+  if (elmdb_dbi->elmdb_env->txn_queue_size >= elmdb_dbi->elmdb_env->max_queue_size) {
+    enif_mutex_unlock(elmdb_dbi->elmdb_env->txn_lock);
+    enif_release_resource(elmdb_dbi);
+    FREE_OP(op);
+    return enif_make_tuple2(env, 
+                          enif_make_atom(env, "error"),
+                          enif_make_atom(env, "queue_full"));
+  }
+  
   PUSH(elmdb_dbi->elmdb_env->txn_queue, op);
+  elmdb_dbi->elmdb_env->txn_queue_size++;
   enif_cond_signal(elmdb_dbi->elmdb_env->txn_cond);
   enif_mutex_unlock(elmdb_dbi->elmdb_env->txn_lock);
   return ATOM_OK;
@@ -1615,11 +1655,23 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   }
   enif_mutex_unlock(env->txn_lock);
   
-  /* Wait if too many concurrent writes using global condition variable */
+  /* Non-blocking write throttling with timeout */
   enif_mutex_lock(g_write_limit_lock);
-  while(g_active_writes >= MAX_CONCURRENT_WRITES) {
-    enif_cond_wait(g_write_limit_cond, g_write_limit_lock);
+  
+  if (g_active_writes >= MAX_CONCURRENT_WRITES) {
+    /* Try waiting with 10ms timeout instead of blocking forever */
+    enif_mutex_unlock(g_write_limit_lock);
+    usleep(1000); /* 1ms backoff */
+    enif_mutex_lock(g_write_limit_lock);
+    
+    /* Check again after backoff */
+    if (g_active_writes >= MAX_CONCURRENT_WRITES) {
+      enif_mutex_unlock(g_write_limit_lock);
+      SEND_ERR(op, enif_make_atom(op->msg_env, "write_throttle_timeout"));
+      goto done;
+    }
   }
+  
   g_active_writes++;
   enif_mutex_unlock(g_write_limit_lock);
   
@@ -1643,10 +1695,10 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   SEND(op, ATOM_OK);
 
  done:
-  /* Release write slot and signal waiting threads */
+  /* Release write slot and signal ALL waiting threads */
   enif_mutex_lock(g_write_limit_lock);
   g_active_writes--;
-  enif_cond_signal(g_write_limit_cond);
+  enif_cond_broadcast(g_write_limit_cond);  /* Wake all waiters to prevent deadlock */
   enif_mutex_unlock(g_write_limit_lock);
   
   enif_release_resource(args->elmdb_dbi);
@@ -2488,6 +2540,7 @@ static int elmdb_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
 
   ATOM_MAPSIZE = enif_make_atom(env, "map_size");
   ATOM_MAXDBS = enif_make_atom(env, "max_dbs");
+  ATOM_QUEUE_SIZE = enif_make_atom(env, "queue_size");
 
   // mdb_db_open flags
   ATOM_REVERSEKEY = enif_make_atom(env, "reverse_key");

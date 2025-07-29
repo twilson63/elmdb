@@ -44,6 +44,7 @@
 
          put/3,
          put_new/3,
+         del/2,
          get/2,
          delete/2,
          drop/1,
@@ -215,6 +216,11 @@ put_new(_Dbi, _Key, _Val) ->
 -spec get(dbi(), key()) -> {ok, val()} | not_found | elmdb_error().
 get(_Dbi, _Key) ->
     ?NOT_LOADED.
+
+%% @doc Delete a key/value pair. Alias for delete/2.
+-spec del(dbi(), key()) -> ok | not_found | elmdb_error().
+del(Dbi, Key) ->
+    delete(Dbi, Key).
 
 -spec delete(dbi(), key()) -> ok | not_found | elmdb_error().
 delete(_Dbi, _Key) ->
