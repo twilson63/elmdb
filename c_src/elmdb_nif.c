@@ -1533,6 +1533,7 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
   ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
+  int retry_count = 0;
   
   /* CRITICAL: Async operations must NEVER reuse transactions
    * Each async operation needs its own isolated transaction
@@ -1569,11 +1570,25 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   g_active_writes++;
   enif_mutex_unlock(g_write_limit_lock);
   
+retry_put:
   if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
   }
-  if((ret = mdb_put(txn, args->elmdb_dbi->dbi, &args->key, &args->val, 0)) != MDB_SUCCESS) {
+  
+  ret = mdb_put(txn, args->elmdb_dbi->dbi, &args->key, &args->val, 0);
+  
+  /* Handle potential race condition with page rebalancing */
+  if (ret == MDB_CORRUPTED && retry_count < 3) {
+    mdb_txn_abort(txn);
+    txn = NULL;
+    retry_count++;
+    /* Small delay to let rebalancing complete */
+    usleep(1000 * retry_count); /* Progressive backoff: 1ms, 2ms, 3ms */
+    goto retry_put;
+  }
+  
+  if(ret != MDB_SUCCESS) {
     mdb_txn_abort(txn);
     SEND_ERRNO(op, ret);
     goto done;
@@ -1655,6 +1670,7 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   kv_args *args = (kv_args*)op->args;
   ElmdbEnv *env = args->elmdb_dbi->elmdb_env;
   int ret;
+  int retry_count = 0;
   
   /* CRITICAL: Async operations must NEVER reuse transactions */
   txn = NULL;
@@ -1689,11 +1705,25 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   g_active_writes++;
   enif_mutex_unlock(g_write_limit_lock);
   
+retry_put_new:
   if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
   }
-  if((ret = mdb_put(txn, args->elmdb_dbi->dbi, &args->key, &args->val, MDB_NOOVERWRITE)) != MDB_SUCCESS) {
+  
+  ret = mdb_put(txn, args->elmdb_dbi->dbi, &args->key, &args->val, MDB_NOOVERWRITE);
+  
+  /* Handle potential race condition with page rebalancing */
+  if (ret == MDB_CORRUPTED && retry_count < 3) {
+    mdb_txn_abort(txn);
+    txn = NULL;
+    retry_count++;
+    /* Small delay to let rebalancing complete */
+    usleep(1000 * retry_count); /* Progressive backoff: 1ms, 2ms, 3ms */
+    goto retry_put_new;
+  }
+  
+  if(ret != MDB_SUCCESS) {
     if(MDB_KEYEXIST == ret) {
       SEND(op, ATOM_EXISTS);
     } else {
@@ -1729,11 +1759,30 @@ static MDB_txn* elmdb_async_get_handler(MDB_txn *txn, OpEntry *op) {
   ERL_NIF_TERM term_val;
   unsigned char *bin;
   int ret;
-  if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
+  int retry_count = 0;
+  
+  /* CRITICAL: Async operations must NEVER reuse transactions */
+  txn = NULL;
+  
+retry_get:
+  if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, MDB_RDONLY, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
   }
-  if((ret = mdb_get(txn, args->elmdb_dbi->dbi, &args->key, &val)) != MDB_SUCCESS) {
+  
+  ret = mdb_get(txn, args->elmdb_dbi->dbi, &args->key, &val);
+  
+  /* Handle potential race condition with page rebalancing */
+  if (ret == MDB_CORRUPTED && retry_count < 3) {
+    mdb_txn_abort(txn);
+    txn = NULL;
+    retry_count++;
+    /* Small delay to let rebalancing complete */
+    usleep(1000 * retry_count); /* Progressive backoff: 1ms, 2ms, 3ms */
+    goto retry_get;
+  }
+  
+  if(ret != MDB_SUCCESS) {
     if(ret == MDB_NOTFOUND) { SEND(op, ATOM_NOT_FOUND); }
     else { SEND_ERRNO(op, ret); }
     goto done;
@@ -1793,15 +1842,30 @@ static ERL_NIF_TERM elmdb_async_get(ErlNifEnv* env, int argc, const ERL_NIF_TERM
 static MDB_txn* elmdb_async_delete_handler(MDB_txn *txn, OpEntry *op) {
   k_args *args = (k_args*)op->args;
   int ret;
+  int retry_count = 0;
   
   /* CRITICAL: Async operations must NEVER reuse transactions */
   txn = NULL;
   
+retry_delete:
   if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
     SEND_ERRNO(op, ret);
     goto done;
   }
-  if((ret = mdb_del(txn, args->elmdb_dbi->dbi, &args->key, NULL)) != MDB_SUCCESS) {
+  
+  ret = mdb_del(txn, args->elmdb_dbi->dbi, &args->key, NULL);
+  
+  /* Handle potential race condition with page rebalancing */
+  if (ret == MDB_CORRUPTED && retry_count < 3) {
+    mdb_txn_abort(txn);
+    txn = NULL;
+    retry_count++;
+    /* Small delay to let rebalancing complete */
+    usleep(1000 * retry_count); /* Progressive backoff: 1ms, 2ms, 3ms */
+    goto retry_delete;
+  }
+  
+  if(ret != MDB_SUCCESS) {
     if(ret == MDB_NOTFOUND) { SEND(op, ATOM_NOT_FOUND); }
     else { SEND_ERRNO(op, ret); }
     mdb_txn_abort(txn);
