@@ -519,7 +519,8 @@ static ElmdbEnv* open_env(const char *path, const EnvOpenOpts *opts, int *ret) {
   elmdb_env->max_queue_size = opts->queue_size;  /* Set configurable max queue size */
   
   /* Initialize auto-resize configuration */
-  elmdb_env->auto_resize = opts->auto_resize;
+  /* TEMPORARILY DISABLED: Auto-resize causing mdb_freelist_save assertion failures */
+  elmdb_env->auto_resize = 0;  /* DISABLED until safe implementation */
   elmdb_env->resize_threshold = opts->resize_threshold;
   elmdb_env->resize_factor = opts->resize_factor;
   elmdb_env->max_map_size = opts->max_map_size;
@@ -611,6 +612,19 @@ static void unregister_env(ElmdbPriv *priv, ElmdbEnv *elmdb_env) {
  * Check if database needs resizing and resize if necessary
  * Only called for write operations to minimize performance impact
  * Returns: 0 on success, MDB error code on failure
+ * 
+ * WARNING: This function is currently DISABLED due to mdb_freelist_save assertion failures.
+ * The issue occurs because resizing while transactions are in-flight can corrupt the freelist.
+ * 
+ * TODO: Implement safer resize approach:
+ * 1. Signal all operations to pause
+ * 2. Wait for ALL operations to complete (not just transactions)
+ * 3. Ensure no new operations can start
+ * 4. Perform resize
+ * 5. Resume operations
+ * 
+ * Alternative: Implement resize in a separate monitoring process that coordinates with
+ * all database users via external synchronization.
  */
 static int check_and_resize_if_needed(ElmdbEnv *elmdb_env, int is_write_op) {
   MDB_stat stat;
