@@ -607,7 +607,21 @@ static void* elmdb_env_thread(void *p) {
       POP(elmdb_env->txn_queue, q_txn);
       elmdb_env->txn_queue_size--;  /* Decrement queue size */
       enif_mutex_unlock(elmdb_env->txn_lock);
-      txn = q_txn->handler(txn, q_txn);
+      
+      /* CRITICAL FIX: Never pass transactions between async handlers
+       * Each async operation must be self-contained with its own transaction.
+       * This prevents the mdb_page_touch assertion failure caused by 
+       * reusing invalid transaction state.
+       */
+      if (q_txn->txn_ref == 0) {
+        /* Async operation - always start fresh, ignore return value */
+        q_txn->handler(NULL, q_txn);
+        txn = NULL;
+      } else {
+        /* Sync transaction operation - maintain transaction state */
+        txn = q_txn->handler(txn, q_txn);
+      }
+      
       enif_mutex_lock(elmdb_env->txn_lock);
       while(txn != NULL && elmdb_env->active_txn_ref > 0 && elmdb_env->shutdown == 0) {
         enif_mutex_unlock(elmdb_env->txn_lock);
