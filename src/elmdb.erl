@@ -38,6 +38,7 @@
          env_close/1,
          env_close_by_name/1,
          env_close_all/0,
+         env_stat/1,
          db_open/2,
          db_open/3,
          db_open/4,
@@ -184,6 +185,10 @@ nif_env_close_by_name(_DirName) ->
 
 -spec env_close_all() -> ok.
 env_close_all() ->
+    ?NOT_LOADED.
+
+-spec env_stat(env()) -> {ok, map()} | elmdb_error().
+env_stat(_Env) ->
     ?NOT_LOADED.
 
 -spec db_open(env(), db_open_opts()) -> {ok, dbi()} | elmdb_error().

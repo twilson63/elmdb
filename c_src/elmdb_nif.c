@@ -47,6 +47,7 @@ typedef struct _OpEntry {
   ERL_NIF_TERM ref;
   void *args;
   MDB_txn* (*handler)(MDB_txn *, struct _OpEntry*);
+  int is_write_op;  /* Flag to indicate if this is a write operation */
   STAILQ_ENTRY(_OpEntry) entries;
 } OpEntry;
 
@@ -67,6 +68,14 @@ typedef struct {
   STAILQ_HEAD(txn_queue, _OpEntry) txn_queue;
   int txn_queue_size;  /* Track queue size to prevent unbounded growth */
   int max_queue_size;  /* Configurable maximum queue size */
+  
+  /* Auto-resize configuration */
+  int auto_resize;           /* Enable/disable auto-resize */
+  double resize_threshold;   /* Threshold percentage (default 0.75) */
+  double resize_factor;      /* Resize multiplier (default 2.0) */
+  uint64_t max_map_size;     /* Maximum allowed map size */
+  uint64_t check_counter;    /* Counter for periodic checks */
+  uint64_t check_interval;   /* Check every N operations */
 } ElmdbEnv;
 
 static ErlNifResourceType *elmdb_dbi_res;
@@ -114,13 +123,20 @@ typedef struct {
   SLIST_HEAD(env_list, _EnvEntry) env_list;
 }  ElmdbPriv;
 
+typedef struct {
+  uint64_t mapsize;
+  unsigned int maxdbs;
+  unsigned int flags;
+  unsigned int queue_size;
+  int auto_resize;
+  double resize_threshold;
+  double resize_factor;
+  uint64_t max_map_size;
+} EnvOpenOpts;
 
 typedef struct {
   char path[MAXPATHLEN];
-  uint64_t mapsize;
-  unsigned int maxdbs;
-  unsigned int envflags;
-  unsigned int queue_size;
+  EnvOpenOpts opts;
   ErlNifPid caller;
   ERL_NIF_TERM ref;
   ErlNifEnv *msg_env;
@@ -186,6 +202,10 @@ static ERL_NIF_TERM ATOM_NOMEMINIT;
 static ERL_NIF_TERM ATOM_MAPSIZE;
 static ERL_NIF_TERM ATOM_MAXDBS;
 static ERL_NIF_TERM ATOM_QUEUE_SIZE;
+static ERL_NIF_TERM ATOM_AUTO_RESIZE;
+static ERL_NIF_TERM ATOM_RESIZE_THRESHOLD;
+static ERL_NIF_TERM ATOM_RESIZE_FACTOR;
+static ERL_NIF_TERM ATOM_MAX_MAP_SIZE;
 
 static ERL_NIF_TERM ATOM_REVERSEKEY;
 static ERL_NIF_TERM ATOM_DUPSORT;
@@ -247,7 +267,7 @@ static int g_initialized = 0;
 
 #define OP_HANDLER(handler) (MDB_txn* (*)(MDB_txn *, OpEntry*))handler
 
-#define NEW_OP_(op_var, op_args, op_handler)                   \
+#define NEW_OP_(op_var, op_args, op_handler, write_flag)       \
   OpEntry *op_var;                                             \
   op_var = (OpEntry*) enif_alloc(sizeof(OpEntry));             \
   op_var->msg_env = enif_alloc_env();                          \
@@ -255,9 +275,13 @@ static int g_initialized = 0;
   op_var->ref = enif_make_copy(op_var->msg_env, argv[0]);      \
   op_var->args = op_args;                                      \
   op_var->handler = op_handler;                                \
+  op_var->is_write_op = write_flag;                            \
 
 #define NEW_OP(op_var, op_args, op_name)                \
-  NEW_OP_(op_var, op_args, OP_HANDLER(op_name));        \
+  NEW_OP_(op_var, op_args, OP_HANDLER(op_name), 0);     \
+
+#define NEW_WRITE_OP(op_var, op_args, op_name)           \
+  NEW_OP_(op_var, op_args, OP_HANDLER(op_name), 1);     \
 
 #define FREE_OP(op_var)                                 \
   enif_free_env(op_var->msg_env);                       \
@@ -472,7 +496,7 @@ static int to_mdb_cursor_op(ErlNifEnv *env, ERL_NIF_TERM op, MDB_val *key) {
   return 0;
 }
 
-static ElmdbEnv* open_env(const char *path, uint64_t mapsize, int maxdbs, int envflags, unsigned int queue_size, int *ret) {
+static ElmdbEnv* open_env(const char *path, const EnvOpenOpts *opts, int *ret) {
   ElmdbEnv *elmdb_env;
 
   if((elmdb_env = enif_alloc_resource(elmdb_env_res, sizeof(ElmdbEnv))) == NULL)
@@ -492,15 +516,23 @@ static ElmdbEnv* open_env(const char *path, uint64_t mapsize, int maxdbs, int en
   STAILQ_INIT(&elmdb_env->op_queue);
   STAILQ_INIT(&elmdb_env->txn_queue);
   elmdb_env->txn_queue_size = 0;  /* Initialize queue size counter */
-  elmdb_env->max_queue_size = queue_size;  /* Set configurable max queue size */
+  elmdb_env->max_queue_size = opts->queue_size;  /* Set configurable max queue size */
+  
+  /* Initialize auto-resize configuration */
+  elmdb_env->auto_resize = opts->auto_resize;
+  elmdb_env->resize_threshold = opts->resize_threshold;
+  elmdb_env->resize_factor = opts->resize_factor;
+  elmdb_env->max_map_size = opts->max_map_size;
+  elmdb_env->check_counter = 0;
+  elmdb_env->check_interval = 10000;  /* Check every 10000 operations */
 
   if((*ret = mdb_env_create(&(elmdb_env->env))) != MDB_SUCCESS)
     goto err1;
-  if((*ret = mdb_env_set_mapsize(elmdb_env->env, mapsize)) != MDB_SUCCESS)
+  if((*ret = mdb_env_set_mapsize(elmdb_env->env, opts->mapsize)) != MDB_SUCCESS)
     goto err1;
-  if((*ret = mdb_env_set_maxdbs(elmdb_env->env, maxdbs)) != MDB_SUCCESS)
+  if((*ret = mdb_env_set_maxdbs(elmdb_env->env, opts->maxdbs)) != MDB_SUCCESS)
     goto err1;
-  if((*ret = mdb_env_open(elmdb_env->env, elmdb_env->path, envflags, 0664)) != MDB_SUCCESS)
+  if((*ret = mdb_env_open(elmdb_env->env, elmdb_env->path, opts->flags, 0664)) != MDB_SUCCESS)
     goto err2;
   if((elmdb_env->op_lock = enif_mutex_create(elmdb_env->path)) == NULL)
     goto err2;
@@ -575,6 +607,78 @@ static void unregister_env(ElmdbPriv *priv, ElmdbEnv *elmdb_env) {
   enif_mutex_unlock(priv->env_lock);
 }
 
+/**
+ * Check if database needs resizing and resize if necessary
+ * Only called for write operations to minimize performance impact
+ * Returns: 0 on success, MDB error code on failure
+ */
+static int check_and_resize_if_needed(ElmdbEnv *elmdb_env, int is_write_op) {
+  MDB_stat stat;
+  MDB_envinfo info;
+  int ret;
+  
+  /* Only check if auto-resize is enabled and this is a write operation */
+  if (!elmdb_env->auto_resize || !is_write_op)
+    return 0;
+    
+  /* Check periodically to avoid performance impact */
+  elmdb_env->check_counter++;
+  if (elmdb_env->check_counter < elmdb_env->check_interval)
+    return 0;
+    
+  elmdb_env->check_counter = 0;
+  
+  /* Get current statistics */
+  ret = mdb_env_stat(elmdb_env->env, &stat);
+  if (ret != MDB_SUCCESS)
+    return ret;
+    
+  ret = mdb_env_info(elmdb_env->env, &info);
+  if (ret != MDB_SUCCESS)
+    return ret;
+    
+  /* Calculate usage */
+  size_t used_bytes = stat.ms_psize * (info.me_last_pgno + 1);
+  double used_percentage = (double)used_bytes / (double)info.me_mapsize;
+  
+  /* Check if resize is needed */
+  if (used_percentage > elmdb_env->resize_threshold) {
+    /* Calculate new size */
+    uint64_t new_size = (uint64_t)(info.me_mapsize * elmdb_env->resize_factor);
+    
+    /* Check against maximum allowed size */
+    if (elmdb_env->max_map_size > 0 && new_size > elmdb_env->max_map_size) {
+      new_size = elmdb_env->max_map_size;
+      if (new_size <= info.me_mapsize) {
+        /* Already at maximum, can't resize */
+        return 0;
+      }
+    }
+    
+    /* Wait for all active transactions to complete */
+    enif_mutex_lock(elmdb_env->txn_lock);
+    while (elmdb_env->active_txn_ref > 0) {
+      enif_mutex_unlock(elmdb_env->txn_lock);
+      usleep(1000);  /* Sleep 1ms */
+      enif_mutex_lock(elmdb_env->txn_lock);
+    }
+    
+    /* Perform resize */
+    ret = mdb_env_set_mapsize(elmdb_env->env, new_size);
+    
+    enif_mutex_unlock(elmdb_env->txn_lock);
+    
+    if (ret == MDB_SUCCESS) {
+      /* Reset check interval after successful resize */
+      elmdb_env->check_interval = 1000;
+    }
+    
+    return ret;
+  }
+  
+  return 0;
+}
+
 static void* elmdb_env_thread(void *p) {
   handler_args *args = (handler_args *) p;
   ElmdbPriv *priv = args->priv;
@@ -584,7 +688,7 @@ static void* elmdb_env_thread(void *p) {
   OpEntry *q_txn = NULL;
   OpEntry *q_op = NULL;
 
-  if((elmdb_env = open_env(args->path, args->mapsize, args->maxdbs, args->envflags, args->queue_size, &ret)) == NULL) {
+  if((elmdb_env = open_env(args->path, &args->opts, &ret)) == NULL) {
     SEND_ERRNO(args, ret);
     enif_free_env(args->msg_env);
     return NULL;
@@ -617,6 +721,9 @@ static void* elmdb_env_thread(void *p) {
         /* Async operation - always start fresh, ignore return value */
         q_txn->handler(NULL, q_txn);
         txn = NULL;
+        
+        /* Check if resize is needed after async write operations */
+        check_and_resize_if_needed(elmdb_env, q_txn->is_write_op);
       } else {
         /* Sync transaction operation - maintain transaction state */
         txn = q_txn->handler(txn, q_txn);
@@ -691,11 +798,16 @@ static ElmdbEnv* get_env(ElmdbPriv *priv, const char *path) {
   return NULL;
 }
 
-static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsize, unsigned int *maxdbs, unsigned int *flags, unsigned int *queue_size) {
-  uint64_t _mapsize = 1073741824;
-  unsigned int _maxdbs = 0;
-  unsigned int _flags = MDB_NOTLS;
-  unsigned int _queue_size = 10000;  /* Default queue size */
+static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env_opts) {
+  env_opts->mapsize = 1073741824;
+  env_opts->maxdbs = 0;
+  env_opts->flags = MDB_NOTLS;
+  env_opts->queue_size = 10000;  /* Default queue size */
+  env_opts->auto_resize = 1;  /* Default: enabled */
+  env_opts->resize_threshold = 0.75;  /* Default: 75% */
+  env_opts->resize_factor = 2.0;  /* Default: double size */
+  env_opts->max_map_size = 0;  /* Default: no limit (0 means use system limit) */
+  
   ERL_NIF_TERM head, tail;
   const ERL_NIF_TERM *tup_array;
   int tup_arity = 0;
@@ -705,23 +817,23 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsiz
 
     if(enif_is_atom(env, head) != 0) {
       if(enif_is_identical(head, ATOM_FIXEDMAP) != 0)
-        _flags = _flags | MDB_FIXEDMAP;
+        env_opts->flags = env_opts->flags | MDB_FIXEDMAP;
       if(enif_is_identical(head, ATOM_NOSUBDIR) != 0)
-        _flags = _flags | MDB_NOSUBDIR;
+        env_opts->flags = env_opts->flags | MDB_NOSUBDIR;
       if(enif_is_identical(head, ATOM_RDONLY) != 0)
-        _flags = _flags | MDB_RDONLY;
+        env_opts->flags = env_opts->flags | MDB_RDONLY;
       if(enif_is_identical(head, ATOM_WRITEMAP) != 0)
-        _flags = _flags | MDB_WRITEMAP;
+        env_opts->flags = env_opts->flags | MDB_WRITEMAP;
       if(enif_is_identical(head, ATOM_NOMETASYNC) != 0)
-        _flags = _flags | MDB_NOMETASYNC;
+        env_opts->flags = env_opts->flags | MDB_NOMETASYNC;
       if(enif_is_identical(head, ATOM_NOSYNC) != 0)
-        _flags = _flags | MDB_NOSYNC;
+        env_opts->flags = env_opts->flags | MDB_NOSYNC;
       if(enif_is_identical(head, ATOM_MAPASYNC) != 0)
-        _flags = _flags | MDB_MAPASYNC;
+        env_opts->flags = env_opts->flags | MDB_MAPASYNC;
       if(enif_is_identical(head, ATOM_NORDAHEAD) != 0)
-        _flags = _flags | MDB_NORDAHEAD;
+        env_opts->flags = env_opts->flags | MDB_NORDAHEAD;
       if(enif_is_identical(head, ATOM_NOMEMINIT) != 0)
-        _flags = _flags | MDB_NOMEMINIT;
+        env_opts->flags = env_opts->flags | MDB_NOMEMINIT;
     }
     else if(enif_get_tuple(env, head, &tup_arity, &tup_array) != 0) {
       if(tup_arity == 2) {
@@ -730,26 +842,52 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, uint64_t *mapsiz
            unsigned long temp_mapsize;
            if(enif_get_ulong(env, tup_array[1], &temp_mapsize) == 0)
              return 0;
-           _mapsize = temp_mapsize;
+           env_opts->mapsize = temp_mapsize;
         } else if(enif_is_identical(tup_array[0], ATOM_QUEUE_SIZE) != 0) {
            unsigned int temp_queue_size;
            if(enif_get_uint(env, tup_array[1], &temp_queue_size) == 0)
              return 0;
-           _queue_size = temp_queue_size;
-        } else
+           env_opts->queue_size = temp_queue_size;
+        } else if(enif_is_identical(tup_array[0], ATOM_MAXDBS) != 0) {
+           if(enif_get_uint(env, tup_array[1], &env_opts->maxdbs) == 0)
+             return 0;
+        } else if(enif_is_identical(tup_array[0], ATOM_AUTO_RESIZE) != 0) {
+           if(enif_is_atom(env, tup_array[1])) {
+             if(enif_is_identical(tup_array[1], enif_make_atom(env, "true")))
+               env_opts->auto_resize = 1;
+             else if(enif_is_identical(tup_array[1], enif_make_atom(env, "false")))
+               env_opts->auto_resize = 0;
+             else
+               return 0;
+           } else {
+             return 0;
+           }
+        } else if(enif_is_identical(tup_array[0], ATOM_RESIZE_THRESHOLD) != 0) {
+           double temp_threshold;
+           if(enif_get_double(env, tup_array[1], &temp_threshold) == 0)
+             return 0;
+           if(temp_threshold <= 0.0 || temp_threshold >= 1.0)
+             return 0;  /* Must be between 0 and 1 */
+           env_opts->resize_threshold = temp_threshold;
+        } else if(enif_is_identical(tup_array[0], ATOM_RESIZE_FACTOR) != 0) {
+           double temp_factor;
+           if(enif_get_double(env, tup_array[1], &temp_factor) == 0)
+             return 0;
+           if(temp_factor <= 1.0)
+             return 0;  /* Must be greater than 1 */
+           env_opts->resize_factor = temp_factor;
+        } else if(enif_is_identical(tup_array[0], ATOM_MAX_MAP_SIZE) != 0) {
+           unsigned long temp_max_size;
+           if(enif_get_ulong(env, tup_array[1], &temp_max_size) == 0)
+             return 0;
+           env_opts->max_map_size = temp_max_size;
+        } else {
           return 0;
-
-        if(enif_is_identical(tup_array[0], ATOM_MAXDBS) != 0 &&
-           enif_get_uint(env, tup_array[1], &_maxdbs) == 0)
-          return 0;
+        }
       } else return 0;
     }
     else return 0;
   }
-  *mapsize = _mapsize;
-  *maxdbs = _maxdbs;
-  *flags = _flags;
-  *queue_size = _queue_size;
   return 1;
 }
 
@@ -804,7 +942,7 @@ static ERL_NIF_TERM elmdb_env_open(ErlNifEnv* env, int argc, const ERL_NIF_TERM 
   if(enif_get_string(env, argv[1], args->path, MAXPATHLEN, ERL_NIF_LATIN1) == 0)
     return BADARG;
 
-  if(get_env_open_opts(env, argv[2], &args->mapsize, &args->maxdbs, &args->envflags, &args->queue_size) == 0)
+  if(get_env_open_opts(env, argv[2], &args->opts) == 0)
     return BADARG;
 
   args->priv = (ElmdbPriv*)enif_priv_data(env);
@@ -1047,7 +1185,7 @@ static ERL_NIF_TERM do_txn_put(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv
   if(elmdb_txn->elmdb_env->ref != elmdb_dbi->elmdb_env->ref)
     return BADARG;
   kv_args *args = enif_alloc(sizeof(kv_args));
-  NEW_OP_(op, args, handler);
+  NEW_OP_(op, args, handler, 1);  /* Write operation */
   op->txn_ref = elmdb_txn->ref;
   term_key = enif_make_copy(op->msg_env, argv[3]);
   term_val = enif_make_copy(op->msg_env, argv[4]);
@@ -1626,7 +1764,7 @@ static ERL_NIF_TERM do_async_put(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
   LOCKED_CHECK_ENV(elmdb_dbi->elmdb_env);
 
   kv_args *args = enif_alloc(sizeof(kv_args));
-  NEW_OP(op, args, handler);
+  NEW_WRITE_OP(op, args, handler);
   op->txn_ref = 0;
   term_key = enif_make_copy(op->msg_env, argv[2]);
   term_val = enif_make_copy(op->msg_env, argv[3]);
@@ -1815,7 +1953,7 @@ static ERL_NIF_TERM do_async_get(ErlNifEnv* env, int argc, const ERL_NIF_TERM ar
   LOCKED_CHECK_ENV(elmdb_dbi->elmdb_env);
 
   k_args *args = enif_alloc(sizeof(k_args));
-  NEW_OP_(op, args, handler);
+  NEW_OP_(op, args, handler, 0);  /* Read operation */
   op->txn_ref = 0;
   term_key = enif_make_copy(op->msg_env, argv[2]);
 
@@ -1897,7 +2035,7 @@ static ERL_NIF_TERM elmdb_async_delete(ErlNifEnv* env, int argc, const ERL_NIF_T
   LOCKED_CHECK_ENV(elmdb_dbi->elmdb_env);
 
   k_args *args = enif_alloc(sizeof(k_args));
-  NEW_OP(op, args, elmdb_async_delete_handler);
+  NEW_WRITE_OP(op, args, elmdb_async_delete_handler);
   op->txn_ref = 0;
   term_key = enif_make_copy(op->msg_env, argv[2]);
   if(enif_inspect_binary(env, term_key, &bin_key) == 0) {
@@ -1954,7 +2092,7 @@ static ERL_NIF_TERM elmdb_async_drop(ErlNifEnv* env, int argc, const ERL_NIF_TER
   LOCKED_CHECK_ENV(elmdb_dbi->elmdb_env);
 
   dbi_args *args = enif_alloc(sizeof(dbi_args));
-  NEW_OP(op, args, elmdb_async_drop_handler);
+  NEW_WRITE_OP(op, args, elmdb_async_drop_handler);
   op->txn_ref = 0;
   args->elmdb_dbi = elmdb_dbi;
   enif_keep_resource(elmdb_dbi);
@@ -2619,6 +2757,10 @@ static int elmdb_load(ErlNifEnv* env, void** priv_data, ERL_NIF_TERM load_info)
   ATOM_MAPSIZE = enif_make_atom(env, "map_size");
   ATOM_MAXDBS = enif_make_atom(env, "max_dbs");
   ATOM_QUEUE_SIZE = enif_make_atom(env, "queue_size");
+  ATOM_AUTO_RESIZE = enif_make_atom(env, "auto_resize");
+  ATOM_RESIZE_THRESHOLD = enif_make_atom(env, "resize_threshold");
+  ATOM_RESIZE_FACTOR = enif_make_atom(env, "resize_factor");
+  ATOM_MAX_MAP_SIZE = enif_make_atom(env, "max_map_size");
 
   // mdb_db_open flags
   ATOM_REVERSEKEY = enif_make_atom(env, "reverse_key");
@@ -2846,11 +2988,91 @@ static ERL_NIF_TERM elmdb_reader_check(ErlNifEnv* env, int argc, const ERL_NIF_T
   return enif_make_tuple2(env, ATOM_OK, enif_make_int(env, dead));
 }
 
+/**
+ * Get environment statistics
+ * 
+ * argv[0]    reference to the MDB environment resource
+ */
+static ERL_NIF_TERM elmdb_env_stat(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[]) {
+  ElmdbEnv *elmdb_env;
+  MDB_stat stat;
+  MDB_envinfo info;
+  int ret;
+
+  if(argc != 1 ||
+     !enif_get_resource(env, argv[0], elmdb_env_res, (void**)&elmdb_env)) {
+    return BADARG;
+  }
+
+  /* Check if environment is valid */
+  enif_mutex_lock(elmdb_env->txn_lock);
+  if(elmdb_env->shutdown > 0) {
+    enif_mutex_unlock(elmdb_env->txn_lock);
+    return ERR(ATOM_ENV_CLOSED);
+  }
+  enif_mutex_unlock(elmdb_env->txn_lock);
+
+  /* Get statistics */
+  ret = mdb_env_stat(elmdb_env->env, &stat);
+  if(ret != MDB_SUCCESS) {
+    return ERRNO(ret);
+  }
+
+  /* Get environment info */
+  ret = mdb_env_info(elmdb_env->env, &info);
+  if(ret != MDB_SUCCESS) {
+    return ERRNO(ret);
+  }
+
+  /* Calculate usage */
+  size_t used_bytes = stat.ms_psize * (info.me_last_pgno + 1);
+  double used_percentage = (double)used_bytes / (double)info.me_mapsize * 100.0;
+
+  /* Build result map */
+  ERL_NIF_TERM keys[] = {
+    enif_make_atom(env, "map_size"),
+    enif_make_atom(env, "used_bytes"),
+    enif_make_atom(env, "used_percentage"),
+    enif_make_atom(env, "page_size"),
+    enif_make_atom(env, "depth"),
+    enif_make_atom(env, "branch_pages"),
+    enif_make_atom(env, "leaf_pages"),
+    enif_make_atom(env, "overflow_pages"),
+    enif_make_atom(env, "entries"),
+    enif_make_atom(env, "last_pgno"),
+    enif_make_atom(env, "last_txnid"),
+    enif_make_atom(env, "max_readers"),
+    enif_make_atom(env, "num_readers")
+  };
+
+  ERL_NIF_TERM values[] = {
+    enif_make_uint64(env, info.me_mapsize),
+    enif_make_uint64(env, used_bytes),
+    enif_make_double(env, used_percentage),
+    enif_make_uint(env, stat.ms_psize),
+    enif_make_uint(env, stat.ms_depth),
+    enif_make_uint64(env, stat.ms_branch_pages),
+    enif_make_uint64(env, stat.ms_leaf_pages),
+    enif_make_uint64(env, stat.ms_overflow_pages),
+    enif_make_uint64(env, stat.ms_entries),
+    enif_make_uint64(env, info.me_last_pgno),
+    enif_make_uint64(env, info.me_last_txnid),
+    enif_make_uint(env, info.me_maxreaders),
+    enif_make_uint(env, info.me_numreaders)
+  };
+
+  ERL_NIF_TERM map;
+  enif_make_map_from_arrays(env, keys, values, 13, &map);
+  
+  return enif_make_tuple2(env, ATOM_OK, map);
+}
+
 static ErlNifFunc nif_funcs [] = {
   {"nif_env_open",          3, elmdb_env_open, 0},
   {"env_close",             1, elmdb_env_close, 0},
   {"nif_env_close_by_name", 1, elmdb_env_close_by_name, 0},
   {"env_close_all",         0, elmdb_env_close_all, 0},
+  {"env_stat",              1, elmdb_env_stat, 0},
   {"nif_db_open",           4, elmdb_db_open, 0},
 
   {"put",      3, elmdb_put, 0},
