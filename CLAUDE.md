@@ -42,39 +42,38 @@ elmdb is an Erlang NIF wrapper for LMDB that solves transaction thread-safety by
 - **Retry Logic**: Handles `MDB_CORRUPTED` errors with up to 3 retries and progressive backoff (1-3ms)
 - **Resource Management**: All LMDB objects are NIF resources with proper reference counting
 - **Thread Safety**: One worker thread per environment handles all write transactions
-- **Auto-Resize**: Monitors database usage and automatically doubles map size at 75% capacity
+- **Auto-Resize**: DISABLED - causes freelist corruption under high concurrency
 
 ### Recent Fixes Applied
 
 1. **mdb_page_touch assertion fix**: Async operations now use isolated transactions
 2. **mdb_page_search_root fix**: Added retry logic for transient MDB_CORRUPTED errors
 3. **High concurrency support**: Non-blocking write throttling prevents deadlocks
-4. **Auto-resize implementation**: Prevents MDB_MAP_FULL errors by monitoring and resizing
+4. **mdb_freelist_save fix**: Disabled auto-resize to prevent freelist corruption
 
-### Auto-Resize Feature
+### Auto-Resize Feature - CURRENTLY DISABLED
 
-The auto-resize feature automatically increases the database map size when it reaches 75% capacity:
+**WARNING**: The auto-resize feature is currently DISABLED due to `mdb_freelist_save` assertion failures that occur when resizing while transactions are in-flight.
+
+The auto-resize feature would automatically increase the database map size when it reaches 75% capacity, but it causes database corruption under high concurrency:
 
 ```erlang
-% Enable auto-resize (enabled by default)
+% DO NOT USE - Will be ignored even if specified
 {ok, Env} = elmdb:env_open(Dir, [
     {map_size, 10485760},        % 10MB initial size
-    {auto_resize, true},         % Enable auto-resize (default)
-    {resize_threshold, 0.75},    % Resize at 75% full (default)
-    {resize_factor, 2.0},        % Double the size (default)
-    {max_map_size, 1073741824}   % 1GB maximum size
+    {auto_resize, false},        % ALWAYS DISABLED (ignored if true)
+    {resize_threshold, 0.75},    % Ignored
+    {resize_factor, 2.0},        % Ignored
+    {max_map_size, 1073741824}   % Ignored
 ]).
-
-% Check current usage
-{ok, Stats} = elmdb:env_stat(Env),
-UsedPct = maps:get(used_percentage, Stats).
 ```
 
-**Performance Impact**: None! After optimization, auto-resize actually improves performance:
-- Async PUT: 21% faster
-- Async GET: 124% faster
-- Mixed operations: No impact
-- Only checks on write operations every 10,000 ops
+**Issue**: Causes `mdb.c:3184: Assertion 'pglast <= env->me_pglast' failed in mdb_freelist_save()` under high concurrency (e.g., 51k messages in hyperbeam).
+
+**Workaround**: Set a larger initial `map_size` to avoid needing resize:
+```erlang
+{ok, Env} = elmdb:env_open(Dir, [{map_size, 10737418240}]).  % 10GB initial size
+```
 
 ### Performance Baselines
 

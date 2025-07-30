@@ -631,6 +631,10 @@ static int check_and_resize_if_needed(ElmdbEnv *elmdb_env, int is_write_op) {
   MDB_envinfo info;
   int ret;
   
+  /* DISABLED: Auto-resize causes mdb_freelist_save assertion failures */
+  /* Always return early regardless of settings */
+  return 0;
+  
   /* Only check if auto-resize is enabled and this is a write operation */
   if (!elmdb_env->auto_resize || !is_write_op)
     return 0;
@@ -817,7 +821,7 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
   env_opts->maxdbs = 0;
   env_opts->flags = 0;  /* Removed MDB_NOTLS to fix mdb_page_touch assertion */
   env_opts->queue_size = 10000;  /* Default queue size */
-  env_opts->auto_resize = 1;  /* Default: enabled */
+  env_opts->auto_resize = 0;  /* DISABLED: causes mdb_freelist_save assertion failures */
   env_opts->resize_threshold = 0.75;  /* Default: 75% */
   env_opts->resize_factor = 2.0;  /* Default: double size */
   env_opts->max_map_size = 0;  /* Default: no limit (0 means use system limit) */
@@ -867,11 +871,11 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
              return 0;
         } else if(enif_is_identical(tup_array[0], ATOM_AUTO_RESIZE) != 0) {
            if(enif_is_atom(env, tup_array[1])) {
-             if(enif_is_identical(tup_array[1], enif_make_atom(env, "true")))
-               env_opts->auto_resize = 1;
-             else if(enif_is_identical(tup_array[1], enif_make_atom(env, "false")))
-               env_opts->auto_resize = 0;
-             else
+             /* DISABLED: Auto-resize causes mdb_freelist_save assertion failures */
+             /* Ignore user setting and always keep disabled */
+             env_opts->auto_resize = 0;
+             if(!enif_is_identical(tup_array[1], enif_make_atom(env, "true")) &&
+                !enif_is_identical(tup_array[1], enif_make_atom(env, "false")))
                return 0;
            } else {
              return 0;
