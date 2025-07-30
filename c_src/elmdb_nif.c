@@ -902,6 +902,20 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
     }
     else return 0;
   }
+  
+  /* CRITICAL: If using no_sync with no_mem_init, we need MDB_NOTLS to prevent
+   * dirty page list overflow. Without MDB_NOTLS, the dirty list can exceed 
+   * its maximum size (131,071 entries) causing assertion failures.
+   * Alternatively, add MDB_WRITEMAP to avoid the dirty list limitation. */
+  if ((env_opts->flags & MDB_NOSYNC) && (env_opts->flags & MDB_NOMEMINIT)) {
+    /* Option 1: Re-enable MDB_NOTLS for this specific combination */
+    env_opts->flags |= MDB_NOTLS;
+    
+    /* Option 2 (alternative): Add MDB_WRITEMAP to use direct memory writes
+     * This avoids the dirty list but requires OS support for sparse files */
+    /* env_opts->flags |= MDB_WRITEMAP; */
+  }
+  
   return 1;
 }
 
