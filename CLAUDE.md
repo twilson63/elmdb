@@ -46,7 +46,7 @@ elmdb is an Erlang NIF wrapper for LMDB that solves transaction thread-safety by
 
 ### Recent Fixes Applied
 
-1. **mdb_page_touch assertion fix**: Async operations now use isolated transactions
+1. **mdb_page_touch assertion fix**: Removed MDB_NOTLS flag usage completely, use MDB_WRITEMAP for no_sync+no_mem_init
 2. **mdb_page_search_root fix**: Added retry logic for transient MDB_CORRUPTED errors
 3. **High concurrency support**: Non-blocking write throttling prevents deadlocks
 4. **mdb_freelist_save fix**: Disabled auto-resize to prevent freelist corruption
