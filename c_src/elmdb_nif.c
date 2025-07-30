@@ -916,18 +916,11 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
     /* env_opts->flags |= MDB_WRITEMAP; */
   }
   
-  /* CRITICAL FIX: For databases with map_size >= 5GB, we MUST use MDB_NOTLS
-   * to prevent mdb_page_touch assertion failures. At this scale, the probability
-   * of page collisions without thread-local storage becomes too high.
-   * See 5GB_THRESHOLD_EXPLANATION.md for detailed analysis. */
-  if (env_opts->mapsize >= (5ULL * 1024 * 1024 * 1024)) {
-    /* For large databases, MDB_NOTLS is required to prevent assertion failures */
-    env_opts->flags |= MDB_NOTLS;
-    
-    /* Log warning about large database mode */
-    enif_fprintf(stderr, "elmdb: Large database mode activated (map_size >= 5GB). "
-                         "Using MDB_NOTLS to prevent page collisions.\n");
-  }
+  /* CRITICAL: Do NOT use MDB_NOTLS for large databases!
+   * MDB_NOTLS causes mdb_page_touch assertion failures at scale by removing
+   * thread-local storage, leading to page collisions when databases exceed 5GB.
+   * See 5GB_THRESHOLD_EXPLANATION.md for detailed analysis.
+   * The fix is to ensure proper thread isolation WITHOUT MDB_NOTLS. */
   
   return 1;
 }
