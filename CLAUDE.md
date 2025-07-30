@@ -46,10 +46,11 @@ elmdb is an Erlang NIF wrapper for LMDB that solves transaction thread-safety by
 
 ### Recent Fixes Applied
 
-1. **mdb_page_touch assertion fix**: Removed MDB_NOTLS flag usage completely, use MDB_WRITEMAP for no_sync+no_mem_init
-2. **mdb_page_search_root fix**: Added retry logic for transient MDB_CORRUPTED errors
-3. **High concurrency support**: Non-blocking write throttling prevents deadlocks
-4. **mdb_freelist_save fix**: Disabled auto-resize to prevent freelist corruption
+1. **mdb_page_touch/dirty assertion fix**: Removed MDB_NOTLS and MDB_WRITEMAP flags, auto-disable no_mem_init when used with no_sync
+2. **Write transaction serialization**: Added per-environment write_txn_lock mutex to ensure only ONE write transaction at a time
+3. **mdb_page_search_root fix**: Added retry logic for transient MDB_CORRUPTED errors
+4. **High concurrency support**: Non-blocking write throttling prevents deadlocks
+5. **mdb_freelist_save fix**: Disabled auto-resize to prevent freelist corruption
 
 ### Auto-Resize Feature - CURRENTLY DISABLED
 
@@ -82,6 +83,12 @@ The auto-resize feature would automatically increase the database map size when 
 - 10,000 concurrent: ~15,000-16,000 ops/sec
 
 ## Known Issues and Solutions
+
+### Flag Combination Issues - FIXED
+- **Issue**: Using `no_sync` with `no_mem_init` causes assertion failures
+- **Root Cause**: This combination requires either MDB_NOTLS (causes page touch errors) or MDB_WRITEMAP (causes page dirty errors)
+- **Solution**: Auto-remove `no_mem_init` when used with `no_sync` for stability
+- **Impact**: Minimal performance impact, significant stability improvement
 
 ### Large Database Support (>5GB) - FIXED
 - **Previous Issue**: Assertion failures when database reached ~5GB

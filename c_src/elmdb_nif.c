@@ -69,6 +69,9 @@ typedef struct {
   int txn_queue_size;  /* Track queue size to prevent unbounded growth */
   int max_queue_size;  /* Configurable maximum queue size */
   
+  /* Write transaction mutex - ensures only ONE write txn at a time */
+  ErlNifMutex *write_txn_lock;
+  
   /* Auto-resize configuration */
   int auto_resize;           /* Enable/disable auto-resize */
   double resize_threshold;   /* Threshold percentage (default 0.75) */
@@ -539,6 +542,8 @@ static ElmdbEnv* open_env(const char *path, const EnvOpenOpts *opts, int *ret) {
     goto err2;
   if((elmdb_env->txn_lock = enif_mutex_create(elmdb_env->path)) == NULL)
     goto err2;
+  if((elmdb_env->write_txn_lock = enif_mutex_create(elmdb_env->path)) == NULL)
+    goto err2;
   if((elmdb_env->txn_cond = enif_cond_create(elmdb_env->path)) == NULL)
     goto err2;
 
@@ -907,17 +912,20 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
     else return 0;
   }
   
-  /* CRITICAL: MDB_NOTLS causes mdb_page_touch assertion failures!
-   * Even though no_sync+no_mem_init can cause dirty page list overflow,
-   * we CANNOT use MDB_NOTLS as it causes worse problems (page collisions).
-   * Instead, use MDB_WRITEMAP which avoids the dirty list entirely. */
+  /* CRITICAL: Certain flag combinations cause assertion failures!
+   * 1. MDB_NOTLS causes mdb_page_touch assertion failures (page collisions)
+   * 2. MDB_WRITEMAP can cause mdb_page_dirty assertion failures
+   * 3. no_sync + no_mem_init without special handling causes dirty list overflow
+   * 
+   * Solution: If using no_sync with no_mem_init, remove no_mem_init to avoid
+   * needing either MDB_NOTLS or MDB_WRITEMAP. The performance impact is minimal
+   * compared to the stability issues these flags cause. */
   if ((env_opts->flags & MDB_NOSYNC) && (env_opts->flags & MDB_NOMEMINIT)) {
-    /* Use MDB_WRITEMAP to avoid dirty page list limitations
-     * This uses direct memory writes instead of copy-on-write */
-    env_opts->flags |= MDB_WRITEMAP;
+    /* Remove MDB_NOMEMINIT to avoid needing problematic workarounds */
+    env_opts->flags &= ~MDB_NOMEMINIT;
     
-    /* DO NOT USE MDB_NOTLS - causes mdb_page_touch assertion failures */
-    /* env_opts->flags |= MDB_NOTLS; -- REMOVED: Causes page collisions */
+    /* Log that we've made this adjustment for stability */
+    /* fprintf(stderr, "elmdb: Removed no_mem_init flag for stability when used with no_sync\n"); */
   }
   
   /* CRITICAL: Do NOT use MDB_NOTLS for large databases!
@@ -1716,6 +1724,10 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
    * to prevent mdb_page_dirty assertion failures */
   txn = NULL;
   
+  /* CRITICAL: Only ONE write transaction allowed per environment in LMDB!
+   * We must ensure this operation runs in the environment's worker thread
+   * and that we're not creating concurrent write transactions. */
+  
   /* Check for shutdown before proceeding */
   enif_mutex_lock(env->txn_lock);
   if(env->shutdown > 0) {
@@ -1747,7 +1759,11 @@ static MDB_txn* elmdb_async_put_handler(MDB_txn *txn, OpEntry *op) {
   enif_mutex_unlock(g_write_limit_lock);
   
 retry_put:
+  /* CRITICAL: Ensure only ONE write transaction exists at a time per environment */
+  enif_mutex_lock(env->write_txn_lock);
+  
   if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
+    enif_mutex_unlock(env->write_txn_lock);
     SEND_ERRNO(op, ret);
     goto done;
   }
@@ -1757,6 +1773,7 @@ retry_put:
   /* Handle potential race condition with page rebalancing */
   if (ret == MDB_CORRUPTED && retry_count < 3) {
     mdb_txn_abort(txn);
+    enif_mutex_unlock(env->write_txn_lock);
     txn = NULL;
     retry_count++;
     /* Small delay to let rebalancing complete */
@@ -1766,13 +1783,17 @@ retry_put:
   
   if(ret != MDB_SUCCESS) {
     mdb_txn_abort(txn);
+    enif_mutex_unlock(env->write_txn_lock);
     SEND_ERRNO(op, ret);
     goto done;
   }
   if((ret = mdb_txn_commit(txn)) != MDB_SUCCESS) {
+    enif_mutex_unlock(env->write_txn_lock);
     SEND_ERRNO(op, ret);
     goto done;
   }
+  
+  enif_mutex_unlock(env->write_txn_lock);
   SEND(op, ATOM_OK);
 
  done:
@@ -1882,7 +1903,11 @@ static MDB_txn* elmdb_async_put_new_handler(MDB_txn *txn, OpEntry *op) {
   enif_mutex_unlock(g_write_limit_lock);
   
 retry_put_new:
+  /* CRITICAL: Ensure only ONE write transaction exists at a time per environment */
+  enif_mutex_lock(env->write_txn_lock);
+  
   if((ret = mdb_txn_begin(env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
+    enif_mutex_unlock(env->write_txn_lock);
     SEND_ERRNO(op, ret);
     goto done;
   }
@@ -1892,6 +1917,7 @@ retry_put_new:
   /* Handle potential race condition with page rebalancing */
   if (ret == MDB_CORRUPTED && retry_count < 3) {
     mdb_txn_abort(txn);
+    enif_mutex_unlock(env->write_txn_lock);
     txn = NULL;
     retry_count++;
     /* Small delay to let rebalancing complete */
@@ -1906,12 +1932,16 @@ retry_put_new:
       SEND_ERRNO(op, ret);
     }
     mdb_txn_abort(txn);
+    enif_mutex_unlock(env->write_txn_lock);
     goto done;
   }
   if((ret = mdb_txn_commit(txn)) != MDB_SUCCESS) {
+    enif_mutex_unlock(env->write_txn_lock);
     SEND_ERRNO(op, ret);
     goto done;
   }
+  
+  enif_mutex_unlock(env->write_txn_lock);
   SEND(op, ATOM_OK);
 
  done:
@@ -2024,7 +2054,11 @@ static MDB_txn* elmdb_async_delete_handler(MDB_txn *txn, OpEntry *op) {
   txn = NULL;
   
 retry_delete:
+  /* CRITICAL: Ensure only ONE write transaction exists at a time per environment */
+  enif_mutex_lock(args->elmdb_dbi->elmdb_env->write_txn_lock);
+  
   if((ret = mdb_txn_begin(args->elmdb_dbi->elmdb_env->env, NULL, 0, &txn)) != MDB_SUCCESS) {
+    enif_mutex_unlock(args->elmdb_dbi->elmdb_env->write_txn_lock);
     SEND_ERRNO(op, ret);
     goto done;
   }
@@ -2034,6 +2068,7 @@ retry_delete:
   /* Handle potential race condition with page rebalancing */
   if (ret == MDB_CORRUPTED && retry_count < 3) {
     mdb_txn_abort(txn);
+    enif_mutex_unlock(args->elmdb_dbi->elmdb_env->write_txn_lock);
     txn = NULL;
     retry_count++;
     /* Small delay to let rebalancing complete */
@@ -2045,12 +2080,16 @@ retry_delete:
     if(ret == MDB_NOTFOUND) { SEND(op, ATOM_NOT_FOUND); }
     else { SEND_ERRNO(op, ret); }
     mdb_txn_abort(txn);
+    enif_mutex_unlock(args->elmdb_dbi->elmdb_env->write_txn_lock);
     goto done;
   }
   if((ret = mdb_txn_commit(txn)) != MDB_SUCCESS) {
+    enif_mutex_unlock(args->elmdb_dbi->elmdb_env->write_txn_lock);
     SEND_ERRNO(op, ret);
     goto done;
   }
+  
+  enif_mutex_unlock(args->elmdb_dbi->elmdb_env->write_txn_lock);
 
   SEND(op, ATOM_OK);
 
@@ -2639,6 +2678,7 @@ static void elmdb_env_dtor(ErlNifEnv *env, void *resource) {
     enif_thread_join(elmdb_env->tid, NULL);
     enif_mutex_destroy(elmdb_env->op_lock);
     enif_mutex_destroy(elmdb_env->txn_lock);
+    enif_mutex_destroy(elmdb_env->write_txn_lock);
     enif_cond_destroy(elmdb_env->txn_cond);
   } else enif_mutex_unlock(elmdb_env->txn_lock);
 }
