@@ -84,10 +84,12 @@ UsedPct = maps:get(used_percentage, Stats).
 
 ## Known Issues and Solutions
 
-### Large Database Support (>5GB)
-- Set virtual memory ulimit to unlimited: `ulimit -v unlimited`
-- Configure appropriate map_size in `env_open/2` options
-- See `5GB_DATABASE_SIZE_ANALYSIS.md` for details
+### Large Database Support (>5GB) - FIXED
+- **Previous Issue**: Assertion failures when database reached ~5GB
+- **Root Cause**: MDB_NOTLS flag caused thread synchronization issues at scale
+- **Solution**: Removed MDB_NOTLS flag and added proper synchronization
+- **Details**: See `5GB_THRESHOLD_EXPLANATION.md` for complete analysis
+- Still recommended: Set virtual memory ulimit to unlimited: `ulimit -v unlimited`
 
 ### System Configuration
 ```bash
