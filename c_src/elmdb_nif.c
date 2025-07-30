@@ -938,11 +938,14 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
     env_opts->flags &= ~MDB_WRITEMAP;
   }
   
-  /* CRITICAL: Do NOT use MDB_NOTLS for large databases!
+  /* CRITICAL: Do NOT use MDB_NOTLS - causes mdb_page_touch assertion!
    * MDB_NOTLS causes mdb_page_touch assertion failures at scale by removing
    * thread-local storage, leading to page collisions when databases exceed 5GB.
    * See 5GB_THRESHOLD_EXPLANATION.md for detailed analysis.
    * The fix is to ensure proper thread isolation WITHOUT MDB_NOTLS. */
+  if (env_opts->flags & MDB_NOTLS) {
+    env_opts->flags &= ~MDB_NOTLS;
+  }
   
   return 1;
 }
