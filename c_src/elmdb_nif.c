@@ -912,20 +912,30 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
     else return 0;
   }
   
-  /* CRITICAL: Certain flag combinations cause assertion failures!
+  /* CRITICAL: Certain flags cause assertion failures under high concurrency!
    * 1. MDB_NOTLS causes mdb_page_touch assertion failures (page collisions)
    * 2. MDB_WRITEMAP can cause mdb_page_dirty assertion failures
-   * 3. no_sync + no_mem_init without special handling causes dirty list overflow
+   * 3. MDB_NOSYNC causes dirty list overflow leading to mdb_page_dirty assertion
+   * 4. MDB_NOMEMINIT combined with other flags compounds the issues
    * 
-   * Solution: If using no_sync with no_mem_init, remove no_mem_init to avoid
-   * needing either MDB_NOTLS or MDB_WRITEMAP. The performance impact is minimal
-   * compared to the stability issues these flags cause. */
-  if ((env_opts->flags & MDB_NOSYNC) && (env_opts->flags & MDB_NOMEMINIT)) {
-    /* Remove MDB_NOMEMINIT to avoid needing problematic workarounds */
+   * Solution: Remove ALL problematic flags for stability. The performance impact
+   * is acceptable compared to database corruption and assertion failures. */
+  
+  /* Remove MDB_NOSYNC - causes dirty page list overflow */
+  if (env_opts->flags & MDB_NOSYNC) {
+    env_opts->flags &= ~MDB_NOSYNC;
+    /* Use MDB_NOMETASYNC instead for better performance with safety */
+    env_opts->flags |= MDB_NOMETASYNC;
+  }
+  
+  /* Remove MDB_NOMEMINIT - compounds issues with other flags */
+  if (env_opts->flags & MDB_NOMEMINIT) {
     env_opts->flags &= ~MDB_NOMEMINIT;
-    
-    /* Log that we've made this adjustment for stability */
-    /* fprintf(stderr, "elmdb: Removed no_mem_init flag for stability when used with no_sync\n"); */
+  }
+  
+  /* Never allow MDB_WRITEMAP - causes mdb_page_dirty issues */
+  if (env_opts->flags & MDB_WRITEMAP) {
+    env_opts->flags &= ~MDB_WRITEMAP;
   }
   
   /* CRITICAL: Do NOT use MDB_NOTLS for large databases!

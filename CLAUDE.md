@@ -46,7 +46,7 @@ elmdb is an Erlang NIF wrapper for LMDB that solves transaction thread-safety by
 
 ### Recent Fixes Applied
 
-1. **mdb_page_touch/dirty assertion fix**: Removed MDB_NOTLS and MDB_WRITEMAP flags, auto-disable no_mem_init when used with no_sync
+1. **Flag safety enforcement**: Remove ALL problematic flags (MDB_NOSYNC, MDB_NOMEMINIT, MDB_WRITEMAP) to prevent assertions
 2. **Write transaction serialization**: Added per-environment write_txn_lock mutex to ensure only ONE write transaction at a time
 3. **mdb_page_search_root fix**: Added retry logic for transient MDB_CORRUPTED errors
 4. **High concurrency support**: Non-blocking write throttling prevents deadlocks
@@ -84,11 +84,18 @@ The auto-resize feature would automatically increase the database map size when 
 
 ## Known Issues and Solutions
 
-### Flag Combination Issues - FIXED
-- **Issue**: Using `no_sync` with `no_mem_init` causes assertion failures
-- **Root Cause**: This combination requires either MDB_NOTLS (causes page touch errors) or MDB_WRITEMAP (causes page dirty errors)
-- **Solution**: Auto-remove `no_mem_init` when used with `no_sync` for stability
-- **Impact**: Minimal performance impact, significant stability improvement
+### Flag Safety Enforcement - FIXED
+- **Issue**: Various LMDB flags cause assertion failures under high concurrency
+- **Root Causes**:
+  - `MDB_NOTLS`: Causes mdb_page_touch assertion (page collisions)
+  - `MDB_WRITEMAP`: Causes mdb_page_dirty assertion
+  - `MDB_NOSYNC`: Causes dirty page list overflow → mdb_page_dirty assertion
+  - `MDB_NOMEMINIT`: Compounds issues when combined with other flags
+- **Solution**: Automatically remove ALL problematic flags:
+  - Replace `no_sync` with safer `no_metasync` (still improves performance)
+  - Remove `no_mem_init` entirely
+  - Remove `writemap` entirely
+- **Impact**: Some performance impact but prevents database corruption and crashes
 
 ### Large Database Support (>5GB) - FIXED
 - **Previous Issue**: Assertion failures when database reached ~5GB
