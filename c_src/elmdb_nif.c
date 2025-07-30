@@ -815,7 +815,7 @@ static ElmdbEnv* get_env(ElmdbPriv *priv, const char *path) {
 static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env_opts) {
   env_opts->mapsize = 1073741824;
   env_opts->maxdbs = 0;
-  env_opts->flags = MDB_NOTLS;
+  env_opts->flags = 0;  /* Removed MDB_NOTLS to fix mdb_page_touch assertion */
   env_opts->queue_size = 10000;  /* Default queue size */
   env_opts->auto_resize = 1;  /* Default: enabled */
   env_opts->resize_threshold = 0.75;  /* Default: 75% */
@@ -2306,7 +2306,7 @@ static ERL_NIF_TERM elmdb_get(ErlNifEnv* env, int argc, const ERL_NIF_TERM argv[
        enif_inspect_binary(env, argv[1], &key))) {
     return BADARG;
   }
-  UNLOCKED_CHECK_ENV(elmdb_dbi->elmdb_env);
+  LOCKED_CHECK_ENV(elmdb_dbi->elmdb_env);  /* Added synchronization to prevent race conditions */
 
   mkey.mv_size  = key.size;
   mkey.mv_data  = key.data;
