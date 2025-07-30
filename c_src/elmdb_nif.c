@@ -825,7 +825,7 @@ static int get_env_open_opts(ErlNifEnv *env, ERL_NIF_TERM opts, EnvOpenOpts *env
   env_opts->mapsize = 1073741824;
   env_opts->maxdbs = 0;
   env_opts->flags = 0;  /* Removed MDB_NOTLS to fix mdb_page_touch assertion */
-  env_opts->queue_size = 10000;  /* Default queue size */
+  env_opts->queue_size = 50000;  /* Default queue size - increased for high-load scenarios */
   env_opts->auto_resize = 0;  /* DISABLED: causes mdb_freelist_save assertion failures */
   env_opts->resize_threshold = 0.75;  /* Default: 75% */
   env_opts->resize_factor = 2.0;  /* Default: double size */

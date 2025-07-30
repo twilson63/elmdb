@@ -39,6 +39,7 @@ elmdb is an Erlang NIF wrapper for LMDB that solves transaction thread-safety by
 ### C NIF Architecture (`c_src/elmdb_nif.c`)
 
 - **Write Throttling**: Limited to 200 concurrent writers via `MAX_CONCURRENT_WRITES`
+- **Queue Size**: Default 50,000 messages (increased from 10k for high-load scenarios)
 - **Retry Logic**: Handles `MDB_CORRUPTED` errors with up to 3 retries and progressive backoff (1-3ms)
 - **Resource Management**: All LMDB objects are NIF resources with proper reference counting
 - **Thread Safety**: One worker thread per environment handles all write transactions
